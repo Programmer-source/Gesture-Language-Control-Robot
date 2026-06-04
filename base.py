@@ -2,54 +2,94 @@ import cv2
 import math
 import mediapipe as mp
 from collections import deque
+import asyncio
+import threading
+import time
+from bleak import BleakClient, BleakScanner
+
+RX_CHARACTERISTIC_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+ble_loop = None
+command_queue = asyncio.Queue()
+client_instance = None
+
+async def ble_worker():
+    """Фоновий асинхронний потік для сканування, підключення та відправки даних"""
+    global client_instance
+    print("Шукаю робота у Bluetooth-оточенні...")
+    
+    target_device = None
+    devices = await BleakScanner.discover()
+    for d in devices:
+        if d.name and ("esp32" in d.name.lower() or "kulya" in d.name.lower() or "robot" in d.name.lower()):
+            target_device = d
+            break
+            
+    if not target_device and devices:
+        for d in devices:
+            if d.name:
+                target_device = d
+                break
+
+    if not target_device:
+        print("Робота не знайдено. Переконайтеся, що на ESP32 подано живлення і блимає синій світлодіод.")
+        return
+
+    print(f"Знайдено пристрій: {target_device.name} [{target_device.address}]. Підключаюся...")
+    
+    try:
+        async with BleakClient(target_device.address) as client:
+            client_instance = client
+            print("З'єднання встановлено! Пульт ДУ активний. Покажіть жест у камеру.")
+            
+            while True:
+                cmd = await command_queue.get()
+                if cmd == "STOP_WORKER":
+                    command_queue.task_done()
+                    break
+                
+                if client.is_connected:
+                    try:
+                        await client.write_gatt_char(RX_CHARACTERISTIC_UUID, (cmd + '\n').encode('utf-8'))
+                    except Exception as e:
+                        print(f"Помилка відправки пакета [{cmd}]: {e}")
+                
+                command_queue.task_done()
+    except Exception as e:
+        print(f"Помилка BLE сесії: {e}")
+
+def start_ble_thread():
+    global ble_loop
+    ble_loop = asyncio.new_event_loop()
+    def run_loop(loop):
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(ble_worker())
+    t = threading.Thread(target=run_loop, args=(ble_loop,), daemon=True)
+    t.start()
+
+def send_cmd(cmd_text):
+    """Функція для безпечного додавання команд у чергу відправки з потоку OpenCV"""
+    if ble_loop and ble_loop.is_running():
+        asyncio.run_coroutine_threadsafe(command_queue.put(cmd_text), ble_loop)
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
-    max_num_hands=2,
+    max_num_hands=1,
     min_detection_confidence=0.8,
     min_tracking_confidence=0.8,
     model_complexity=1
 )
 
 mp_draw = mp.solutions.drawing_utils
+landmark_styles = {i: mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4) for i in range(21)}
 
-# Колір (BGR) та назва для кожної з 21 точки руки
-point_colors = [
-    ((0, 0, 255),     "червоний"),       # 0  - WRIST
-    ((0, 128, 255),   "помаранчевий"),   # 1  - THUMB_CMC
-    ((0, 255, 255),   "жовтий"),         # 2  - THUMB_MCP
-    ((0, 255, 128),   "салатовий"),      # 3  - THUMB_IP
-    ((0, 255, 0),     "зелений"),        # 4  - THUMB_TIP
-    ((128, 255, 0),   "смарагдовий"),    # 5  - INDEX_MCP
-    ((255, 255, 0),   "бірюзовий"),      # 6  - INDEX_PIP
-    ((255, 128, 0),   "блакитний"),      # 7  - INDEX_DIP
-    ((255, 0, 0),     "синій"),          # 8  - INDEX_TIP
-    ((255, 0, 128),   "індиго"),         # 9  - MIDDLE_MCP
-    ((255, 0, 255),   "фіолетовий"),     # 10 - MIDDLE_PIP
-    ((128, 0, 255),   "пурпурний"),      # 11 - MIDDLE_DIP
-    ((180, 105, 255), "рожевий"),        # 12 - MIDDLE_TIP
-    ((33, 67, 101),   "коричневий"),     # 13 - RING_MCP
-    ((0, 128, 128),   "оливковий"),      # 14 - RING_PIP
-    ((128, 128, 0),   "морський"),       # 15 - RING_DIP
-    ((0, 0, 128),     "бордовий"),       # 16 - RING_TIP
-    ((0, 215, 255),   "золотий"),        # 17 - PINKY_MCP
-    ((192, 192, 192), "сріблястий"),     # 18 - PINKY_PIP
-    ((60, 20, 220),   "малиновий"),      # 19 - PINKY_DIP
-    ((203, 192, 255), "лавандовий"),     # 20 - PINKY_TIP
-]
-
-landmark_styles = {
-    i: mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=5)
-    for i, (color, _) in enumerate(point_colors)
-}
-
-# ====================== ЖЕСТИ ======================
 EXT_THRESHOLD    = -0.6
 CURL_THRESHOLD   =  0.3
-DIR_DOMINANCE    = 1.5
 STABILITY_FRAMES = 5
 
-# ---------- БАЗОВІ ХЕЛПЕРИ ----------
+current_index_angle = None
+last_send_time = 0
+SEND_INTERVAL = 0.06  
 
 def _angle_cos(a, b, c):
     bax, bay = a.x - b.x, a.y - b.y
@@ -73,171 +113,131 @@ def _compute_states(lm):
     }
 
 def _only_index_extended(states):
-    return (states['index']  == 'ext'  and
+    return (states['index']  == 'ext' and
             states['middle'] == 'curl' and
             states['ring']   == 'curl' and
             states['pinky']  == 'curl')
 
-def _index_direction(lm):
+def _index_angle_deg(lm):
+    global current_index_angle
     dx = lm[8].x - lm[5].x
-    dy = lm[8].y - lm[5].y
-    adx, ady = abs(dx), abs(dy)
-    if ady > adx * DIR_DOMINANCE:
-        return 'up' if dy < 0 else 'down'
-    if adx > ady * DIR_DOMINANCE:
-        return 'right' if dx > 0 else 'left'
-    return None
-
-# ---------- ДЕТЕКТОРИ ЖЕСТІВ ----------
+    dy = -(lm[8].y - lm[5].y) 
+    angle = math.degrees(math.atan2(dy, dx))
+    current_index_angle = angle
+    return angle
 
 def gesture_open_palm(lm, states):
-    if all(s == 'ext' for s in states.values()):
-        return "Відкрита долоня"
+    if all(s == 'ext' for s in states.values()): return "Відкрита долоня"
     return None
 
 def gesture_fist(lm, states):
-    if all(s == 'curl' for s in states.values()):
-        return "Кулак"
+    if all(s == 'curl' for s in states.values()): return "Кулак"
     return None
 
-def gesture_pointing_up(lm, states):
-    if _only_index_extended(states) and _index_direction(lm) == 'up':
-        return "Палець вгору"
+def gesture_driving(lm, states):
+    if _only_index_extended(states): return "Хода за пальцем"
     return None
 
-def gesture_pointing_down(lm, states):
-    if _only_index_extended(states) and _index_direction(lm) == 'down':
-        return "Палець вниз"
-    return None
-
-def gesture_pointing_left(lm, states):
-    if _only_index_extended(states) and _index_direction(lm) == 'left':
-        return "Палець вліво"
-    return None
-
-def gesture_pointing_right(lm, states):
-    if _only_index_extended(states) and _index_direction(lm) == 'right':
-        return "Палець вправо"
-    return None
-
-GESTURE_DETECTORS = [
-    gesture_open_palm,
-    gesture_fist,
-    gesture_pointing_up,
-    gesture_pointing_down,
-    gesture_pointing_left,
-    gesture_pointing_right,
-]
+GESTURE_DETECTORS = [gesture_open_palm, gesture_fist, gesture_driving]
 
 def detect_gesture(lm):
     states = _compute_states(lm)
     for detector in GESTURE_DETECTORS:
         result = detector(lm, states)
-        if result is not None:
-            return result
+        if result is not None: return result
     return None
 
-# ---------- ХЕНДЛЕРИ ЖЕСТІВ ----------
-# Викликаються коли відповідний жест ВПЕРШЕ зареєстровано стабільно.
-# Зараз - просто print. Сюди можна додавати будь-яку логіку (керування, події, тощо).
-
 def on_open_palm(hand_idx):
-    print(f"[Рука {hand_idx + 1}] Відкрита долоня")
+    print("Подія: ДОЛОНЯ -> Розкрити робота (expand)")
+    send_cmd("ce_value:100")
+    send_cmd("gait:WALK")
 
 def on_fist(hand_idx):
-    print(f"[Рука {hand_idx + 1}] Кулак")
+    print("Подія: КУЛАК -> Закрити/Скласти робота (collapse)")
+    send_cmd("gait:CE")
+    send_cmd("ce_value:5")
 
-def on_pointing_up(hand_idx):
-    print(f"[Рука {hand_idx + 1}] Палець вгору")
+def handle_driving(angle):
+    """Вираховує тригонометричний вектор нахилу пальця і транслює в координати J_XY"""
+    global last_send_time
+    now = time.time()
+    if now - last_send_time < SEND_INTERVAL:
+        return 
+        
+    rad = math.radians(angle)
+    j_x = int(math.cos(rad) * 100)
+    j_y = int(math.sin(rad) * 100)
+    
+    if abs(j_x) < 15: j_x = 0
+    if abs(j_y) < 15: j_y = 0
+        
+    print(f"Подія: ПАЛЕЦЬ (Кут {int(angle)}°) -> Крок вектора J_XY:{j_x}|{j_y}")
+    send_cmd(f"J_XY:{j_x}|{j_y}")
+    last_send_time = now
 
-def on_pointing_down(hand_idx):
-    print(f"[Рука {hand_idx + 1}] Палець вниз")
-
-def on_pointing_left(hand_idx):
-    print(f"[Рука {hand_idx + 1}] Палець вліво")
-
-def on_pointing_right(hand_idx):
-    print(f"[Рука {hand_idx + 1}] Палець вправо")
-
-# Мапа назва_жесту -> хендлер
 GESTURE_HANDLERS = {
     "Відкрита долоня": on_open_palm,
     "Кулак":           on_fist,
-    "Палець вгору":    on_pointing_up,
-    "Палець вниз":     on_pointing_down,
-    "Палець вліво":    on_pointing_left,
-    "Палець вправо":   on_pointing_right,
 }
-# ===================================================
+
+start_ble_thread()
 
 camera = cv2.VideoCapture(0)
-
-hand_coords = {}
 gesture_buffers = {}
 last_stable = {}
 
 while True:
     success, frame = camera.read()
+    if not success: break
 
-    # Дзеркальне відображення кадру
     frame = cv2.flip(frame, 1)
-
-    # Отримуємо розміри кадру (висоту, ширину та кількість каналів)
     h, w, c = frame.shape
-
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    hand_coords.clear()
+    current_index_angle = None 
 
     if results.multi_hand_landmarks:
         for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-
-            # Зберігаємо координати всіх 21 точок руки (без виводу)
-            coords = []
-            for id, landmark in enumerate(hand_landmarks.landmark):
-                cx, cy = int(landmark.x * w), int(landmark.y * h)
-                coords.append((cx, cy, landmark.z))
-            hand_coords[hand_idx] = coords
-
-            # Сирий жест поточного кадру
             raw = detect_gesture(hand_landmarks.landmark)
 
-            # Кільцевий буфер для згладжування
             if hand_idx not in gesture_buffers:
                 gesture_buffers[hand_idx] = deque(maxlen=STABILITY_FRAMES)
             gesture_buffers[hand_idx].append(raw)
             buf = gesture_buffers[hand_idx]
 
-            # Стабільний жест - тільки коли всі N кадрів однакові (і не None)
             stable = None
             if len(buf) == STABILITY_FRAMES and buf[0] is not None and len(set(buf)) == 1:
                 stable = buf[0]
 
-            # При зміні стабільного жесту - викликаємо відповідний хендлер
             prev = last_stable.get(hand_idx)
             if stable != prev:
-                if stable is not None:
-                    handler = GESTURE_HANDLERS.get(stable)
-                    if handler is not None:
-                        handler(hand_idx)
+                if stable in GESTURE_HANDLERS:
+                    GESTURE_HANDLERS[stable](hand_idx)
                 last_stable[hand_idx] = stable
 
-            # Малюємо точки (кожна своїм кольором) та лінії
-            mp_draw.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS,
-                landmark_drawing_spec=landmark_styles
-            )
+            if raw == "Хода за пальцем":
+                angle = _index_angle_deg(hand_landmarks.landmark)
+                handle_driving(angle)
+            elif prev == "Хода за пальцем" and raw != "Хода за пальцем":
+                print("Палець прибрано -> Зупинка руху")
+                send_cmd("J_XY:0|0")
+                last_stable[hand_idx] = None
+
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
     else:
+        if any(v == "Хода за пальцем" for v in last_stable.values()):
+            send_cmd("J_XY:0|0")
         gesture_buffers.clear()
         last_stable.clear()
 
-    cv2.imshow("Hand Tracking", frame)
+    if current_index_angle is not None:
+        cv2.putText(frame, f"Angle: {int(current_index_angle)} deg", (10, h - 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    cv2.imshow("KULYA BLE Controller", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 camera.release()
+send_cmd("STOP_WORKER")
 cv2.destroyAllWindows()
